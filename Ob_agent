@@ -1,0 +1,284 @@
+from pydantic import BaseModel, Field
+from typing import List, Optional, Dict
+from langgraph.graph import StateGraph, END, START
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from prompts.prompt import *
+from pydantic import BaseModel, Field
+from typing import Optional, List, Annotated
+from llm import llm
+from langgraph.graph.message import add_messages
+from langgraph.types import interrupt, Command
+import logging
+from logging import getLogger
+
+import base64
+from io import BytesIO
+
+import json
+
+
+logger = getLogger("onboarding_agent")
+logger.setLevel(logging.DEBUG)
+
+formatter = logging.Formatter(
+    fmt='[%(asctime)s] [%(name)s] [%(levelname)s] - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+
+with open('topics.json', 'r', encoding='utf-8') as f:
+    categories = json.load(f)
+
+def get_subtopics(category_name):
+    subtopics = categories.get(category_name)
+    if subtopics is not None:
+        return subtopics
+    else:
+        return f"No such category '{category_name}' found."
+
+
+def override(_, new):
+    return new
+
+# class BusinessInfoChecklist(BaseModel):
+#     business_overview: bool = True
+#     industry_domain: bool = True
+#     target_market_customers: bool = True
+#     business_model: bool = True
+#     products_or_services: bool = True
+#     teams_departments_culture: bool = True
+#     technology_stack_tools: bool = True
+#     marketing_branding: bool = True
+#     customer_support_service: bool = True
+#     supply_chain_operations: bool = True
+#     financials_performance: bool = True
+#     current_challenges_growth_focus: bool = True
+#     legal_compliance: bool = True
+#     risk_management_security: bool = True
+#     innovation_research: bool = True
+#     strategic_partnerships_alliances: bool = True
+#     corporate_governance: bool = True
+#     environmental_social_governance_esg: bool = True
+#     knowledge_management_training: bool = True
+#     customer_experience_journey: bool = True
+#     international_business_considerations: bool = True
+#     exit_strategy_succession_planning: bool = True
+
+class BusinessInfoChecklist(BaseModel):
+    business_overview: bool = False
+    industry_domain: bool = False
+    target_market_customers: bool = False
+    # business_model: bool = False
+    # products_or_services: bool = False
+    # teams_departments_culture: bool = False
+    # technology_stack_tools: bool = False
+    # marketing_branding: bool = False
+    # customer_support_service: bool = False
+    # supply_chain_operations: bool = False
+    # financials_performance: bool = False
+    # current_challenges_growth_focus: bool = False
+    # legal_compliance: bool = False
+    # risk_management_security: bool = False
+    # innovation_research: bool = False
+    # strategic_partnerships_alliances: bool = False
+    # corporate_governance: bool = False
+    # environmental_social_governance_esg: bool = False
+    # knowledge_management_training: bool = False
+    # customer_experience_journey: bool = False
+    # international_business_considerations: bool = False
+    # exit_strategy_succession_planning: bool = False
+
+class UserConfirmation(BaseModel):
+    user_confirmation: bool=False
+    response:str = ""
+
+class AgentState(BaseModel):
+    query: str = ""
+    context_history: Annotated[list[dict], override] =[]
+    summary: str = ""
+    data: BusinessInfoChecklist = BusinessInfoChecklist()
+    user_confirmation: bool = False
+
+class OnboardingAgent:
+    def __init__(self):
+        self.graph = self.build_graph()
+
+    def build_graph(self):
+        builder = StateGraph(AgentState)
+
+        builder.add_node("GatherInformation", self.gather_information)
+        builder.add_node("VerifyInformation", self.verify_information)
+        builder.add_node("GenerateSummary", self.generate_summary)
+        builder.add_node("UserConfirmation", self.user_confirmation)
+        builder.add_node("SuggestAgents", self.suggest_agents)
+
+        # builder.add_conditional_edges(START, self.route, {"GatherInformation": "GatherInformation", "UserConfirmation": "UserConfirmation"})
+        builder.add_edge(START, "VerifyInformation")
+        builder.add_conditional_edges("VerifyInformation", self.route, {"UserConfirmation": "UserConfirmation", "GatherInformation": "GatherInformation"})
+        builder.add_edge("UserConfirmation", "GenerateSummary")
+        builder.add_edge("GatherInformation", "GenerateSummary")
+        builder.add_conditional_edges("GenerateSummary",self.confirmation_route, {"SuggestAgents": "SuggestAgents", "END": END})
+
+        return builder.compile()
+
+    def route(self, state: AgentState) -> str:
+
+        if all(state.data.dict().values()):
+            return "UserConfirmation"
+        else:
+            return "GatherInformation"
+    
+    def confirmation_route(self, state: AgentState) -> str:
+        if state.user_confirmation:
+            return "SuggestAgents"
+        else:
+            return "END"
+
+    def gather_information(self, state: AgentState) -> AgentState:
+        logger.info("Gathering information")
+        print("Gathering information")
+
+        formatted_context_history = ""
+        if state.context_history:
+            for message in state.context_history[-16:]:
+                role = message["role"].capitalize()
+                content = message["content"]
+                formatted_context_history += f"{role}: {content}\n"
+
+        checklist_dict = state.data.dict()
+        first_false_key = None
+        for key, value in checklist_dict.items():
+            if value is False:
+                first_false_key = key
+                break
+
+        subs= get_subtopics(first_false_key)
+        print(f"\nSubtopics: {subs}\n")
+
+        print(f"\nFirst False Key: {first_false_key}\n")
+        prompt=ASK_FOLLOWUP_QUESTION_PROMPT.format(
+            context_history=formatted_context_history,
+            current_category=first_false_key,
+            current_subtopics=subs,
+            checklist=list(state.data.dict().keys())
+        )
+
+        messages = [AIMessage(content=prompt)]
+        response = llm.invoke(messages)
+        print(f"\n Response: {response} \n")
+        context_history = state.context_history.copy()
+        context_history.append({"role": "assistant", "content": response.content})
+
+        return {"context_history": context_history}
+
+    def verify_information(self,state: AgentState) -> AgentState:
+        print("Verifying information")
+
+        context_history = state.context_history.copy()
+        context_history.append({"role": "user", "content": state.query})
+
+        formatted_context_history = ""
+        if context_history:
+            for message in context_history[-10:]:
+                role = message["role"].capitalize()
+                content = message["content"]
+                formatted_context_history += f"{role}: {content}\n"
+
+        checklist_dict = state.data.dict()
+        first_false_key = None
+        for key, value in checklist_dict.items():
+            if value is False:
+                first_false_key = key
+                break
+
+        prompt=VERIFY_INFORMATION_PROMPT.format(
+            conversation_history=formatted_context_history,
+            current_checklist=state.data.dict(),
+            current_category=first_false_key
+        )
+
+        messages = [AIMessage(content=prompt)]
+        structured_llm = llm.with_structured_output(BusinessInfoChecklist)
+        response = structured_llm.invoke(messages)
+        print(f"\n Verification Response: {response} \n")
+        if isinstance(response, dict):
+            response = BusinessInfoChecklist(**response)
+
+        return {"data": response, "context_history": context_history}
+
+    def generate_summary(self, state: AgentState) -> str:
+
+        print("Generating summary")
+
+        formatted_context_history = ""
+        if state.context_history:
+            for message in state.context_history:
+                role = message["role"].capitalize()
+                content = message["content"]
+                formatted_context_history += f"{role}: {content}\n"
+        
+        prompt = GENERATE_SUMMARY_PROMPT.format(
+            context_history=formatted_context_history
+        )
+        
+        messages = [AIMessage(content=prompt)]
+        response = llm.invoke(messages)
+        # summary="""Runs a coffee shop founded in 2020.
+        # Serves premium coffee made from ethically sourced beans from South America and Africa.
+        # Main customers are people aged 25–45 who enjoy high-quality coffee and value sustainability.
+        # Revenue comes from in-store sales and a coffee subscription service.
+        # Marketing channels include Instagram ads, local events, and word of mouth.
+        # Team consists of 5 members, including a head barista, marketing manager, and cashier."""
+
+        return {"summary": response.content}
+
+    def user_confirmation(self, state: AgentState) -> AgentState:
+        print("\n \n In User confirmation")
+
+        context_history = state.context_history.copy()
+
+        prompt = USER_CONFIRMATION_PROMPT.format(
+            query=state.query,
+            context_history="\n".join([f"{msg['role'].capitalize()}: {msg['content']}" for msg in state.context_history[-10:]] if state.context_history else "")
+        )
+
+        messages = [AIMessage(content=prompt)]
+        structured_llm = llm.with_structured_output(UserConfirmation)
+        response = structured_llm.invoke(messages)
+        print(f"\n User Confirmation: {response}")
+
+        context_history.append({"role": "assistant", "content": response.response})
+        return {"context_history": context_history, "user_confirmation": response.user_confirmation}
+
+    def suggest_agents(self, state: AgentState) -> AgentState:
+        print("\n \n In Suggest Agents")
+        context_history = state.context_history.copy()
+
+        prompt = SUGGEST_AGENTS_PROMPT.format(
+            summary=state.summary
+        )
+        response = llm.invoke([AIMessage(content=prompt)])
+
+        context_history=context_history[:-1]  # Remove the last assistant message
+        context_history.append({"role": "assistant", "content": response.content})
+        # Implement your agent suggestion logic here
+        return {"context_history": context_history}
+
+    def visualize(self):
+        logger.info("Getting visualized planner agent")
+        png_image   = self.graph.get_graph(xray=True).draw_mermaid_png()
+        image_buf   = BytesIO(png_image)
+        img_str     = base64.b64encode(image_buf.getvalue()).decode("utf-8")
+        return {"selection_agent_base64": f"data:image/png;base64,{img_str}"}
+    
+if __name__ == "__main__":
+    agent = OnboardingAgent()
+    # Example usage
+    input_state = {
+        "query": "I want to delete a file on github and send a mail to the client.?",
+        "get_tools_flag": False,
+    }
+    image_dict = agent.visualize()
+    with open("graph.png", "wb") as f:
+        f.write(base64.b64decode(image_dict["selection_agent_base64"].split(",")[1]))
+    #result = agent.graph.invoke(input_state)
+    #print(f"\n Final Result: {result}")
