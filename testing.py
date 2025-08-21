@@ -1,127 +1,151 @@
-import time 
+import time
 import streamlit as st
-from agents_helper.onboarding_agent import OnboardingAgent, AgentState, ToolInfo
+import requests
 
-st.set_page_config(page_title="🧠 Onboarding Agent", page_icon="🤖")
-st.title("🧠 Onboarding Agent Chat")
+from requirements_agent.ob_agent import OnboardingAgent, AgentState, BusinessInfoChecklist
+from config import FASTAPI_URL, GET_RAG_AGENT_URL
+from requirements_agent.utils.rag import process_document, Initialize_vector_store
 
-# Initialize session state
+st.set_page_config(page_title="🧠 Requirements Agent", page_icon="🤖")
+
+st.title("🧠 Requirements Agent")
+
+# ---- Initialize session state ----
 if "agent" not in st.session_state:
     st.session_state.agent = OnboardingAgent()
-
 if "agent_state" not in st.session_state:
     st.session_state.agent_state = AgentState()
-if "selected_tools" not in st.session_state:
-    st.session_state.selected_tools = []
-
-print(st.session_state.selected_tools)
+if "show_uploader" not in st.session_state:
+    st.session_state.show_uploader = False  # controls uploader visibility
+if "first_run" not in st.session_state:
+    st.session_state.first_run = True
+if "documents_processed" not in st.session_state:
+    st.session_state.documents_processed = False
+if "documents_uploaded" not in st.session_state:
+    st.session_state.documents_uploaded = False
 
 agent = st.session_state.agent
 state = st.session_state.agent_state
 
-# Show summary in the sidebar (if it exists)
-st.sidebar.markdown("## 📝 Summary")
 
+# ---- Document uploader trigger ----
+with st.sidebar:
+    if not st.session_state.show_uploader:
+        if st.button("📄 Upload Document"):
+            st.session_state.show_uploader = True
+            st.rerun()
+    st.markdown("---")
+# ---- Sidebar summary ----
+st.sidebar.markdown("## 📝 Summary")
 if state.summary:
     st.sidebar.markdown(state.summary)
 else:
     st.sidebar.markdown("*No summary available yet.*")
 
-if state.tools.tools_needed:
-    st.sidebar.markdown("## 🛠️ Selected Tools")
-
-    updated_selected_tools = set(st.session_state.selected_tools)  # use a set for fast lookup
-
-    for tool in state.tools.tools_needed:
-        label = tool.replace("_", " ")
-        checked = tool in updated_selected_tools
-
-        is_checked = st.sidebar.checkbox(label, value=checked, key=f"needed_tool_{tool}")
-
-        if is_checked:
-            updated_selected_tools.add(tool)
-        else:
-            updated_selected_tools.discard(tool)
-
-    # Update session state only once after the loop
-    st.session_state.selected_tools = list(updated_selected_tools)
-    st.session_state.agent_state.tools_selected = list(updated_selected_tools)
-
-# Display chat history in bubbles
+# ---- Conversation display ----
 st.markdown("### 💬 Conversation")
-prev_role = None
+last_role = None
+context_history = state.context_history[1:] if state.documents_uploaded else state.context_history
 
-for message in state.context_history:
+filtered_history = []
+skip_buffer = None
+
+for message in context_history:
     role = message["role"]
-    
-    # Skip system messages
-    if role == "system":
-        continue
 
-    # Only display message if role is different from the previous one
-    if role != prev_role:
-        with st.chat_message("user" if role == "user" else "assistant"):
-            st.markdown(message["content"])
-        prev_role = role
+    if role == "assistant":
+        # Keep replacing until a different role comes
+        skip_buffer = message
+    else:
+        # If buffer exists, push it before adding user message
+        if skip_buffer:
+            filtered_history.append(skip_buffer)
+            skip_buffer = None
+        filtered_history.append(message)
 
-if state.tools.tools_suggested:
-    filtered_suggestions = [
-        tool for tool in state.tools.tools_suggested if tool not in state.tools.tools_needed
-    ]
+# If the conversation ends with assistant messages, keep the last one
+if skip_buffer:
+    filtered_history.append(skip_buffer)
 
-    if filtered_suggestions:
-        st.markdown("### 💡 Suggested Tools")
+# Now render
+for message in filtered_history:
+    with st.chat_message("user" if message["role"] == "user" else "assistant"):
+        st.markdown(message["content"])
 
-        # Divide the tools into chunks of 4
-        for i in range(0, len(filtered_suggestions), 4):
-            row_tools = filtered_suggestions[i:i+4]
-            cols = st.columns(4)  # create 4 columns
-
-            for col, tool in zip(cols, row_tools):
-                label = tool.replace("_", " ")
-                key = f"suggested_tool_{tool}"
-
-                with col:
-                    is_clicked = st.checkbox(label, key=key)
-                    if is_clicked:
-                        if tool not in st.session_state.selected_tools:
-                            st.session_state.selected_tools.append(tool)
-                        if tool not in state.tools.tools_needed:
-                            state.tools.tools_needed.append(tool)
-                        if tool in state.tools.tools_suggested:
-                            state.tools.tools_suggested.remove(tool)
-                        st.rerun()
-
-# Prompt input
+# ---- Chat input ----
 user_input = st.chat_input("Ask something...")
+# Inject default input on first run (e.g., after document upload)
+# if not st.session_state.first_run and st.session_state.documents_processed:
+#     user_input = "HI"  # Default question for first run
+#     st.session_state.first_run = True
 
-if user_input:
-    # Show user's message immediately
+if user_input or (st.session_state.documents_processed and  st.session_state.first_run):
+    if not user_input:
+        user_input = ""
     with st.chat_message("user"):
-        st.markdown(user_input)
+        if user_input != "":
+            st.markdown(user_input)
 
-    # Placeholder for assistant response
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
-            # Update query in the state
             state.query = user_input
+            try:
+                payload = state.model_dump() 
+                print(f"Payload for agent invocation: {payload}")
+                response = requests.post(FASTAPI_URL, json=payload, timeout=800)
+                response.raise_for_status()
+                result = response.json()
 
-            # Call the graph
-            updated_state_dict = agent.graph.invoke(state.model_dump())
+                updated_state_dict = result.get("result", {})
+                data_value = updated_state_dict.get("data")
 
-            print("Updated state dict:", updated_state_dict)
+                if not isinstance(data_value, BusinessInfoChecklist):
+                    if isinstance(data_value, dict):
+                        data_value = BusinessInfoChecklist(**data_value)
+                    else:
+                        data_value = data_value.model_dump()
 
-            # Convert nested Pydantic model to dict if needed
-            if isinstance(updated_state_dict.get("tools"), ToolInfo):
-                updated_state_dict["tools"] = updated_state_dict["tools"].model_dump()
+                updated_state_dict["data"] = data_value
+                st.session_state.agent_state = AgentState(**updated_state_dict)
+                st.session_state.first_run = False
 
-            # Save back to session
-            st.session_state.agent_state = AgentState(**updated_state_dict)
-            st.session_state.selected_tools = st.session_state.agent_state.tools.tools_needed
-
-            # Show the assistant's last message
-            last_message = updated_state_dict.get("context_history", [])[-1]
-            if last_message and last_message["role"] == "assistant":
-                st.markdown(last_message["content"])
+                last_message = updated_state_dict.get("context_history", [])[-1]
+                if last_message and last_message["role"] == "assistant":
+                    st.markdown(last_message["content"])
+            except requests.RequestException as e:
+                st.error(f"Error invoking agent: {e}")
 
     st.rerun()
+
+
+
+# ---- Document uploader section ----
+if st.session_state.show_uploader:
+    uploaded_files = st.file_uploader(
+        "Choose a file",
+        type=["txt", "pdf", "png", "jpg", "jpeg"],
+        accept_multiple_files=True,
+    )
+
+    if uploaded_files:
+        state.documents_uploaded = True
+        st.session_state.documents_uploaded = True
+        with st.spinner("Processing files..."):
+            for uploaded_file in uploaded_files:
+                st.info(f"**File name:** {uploaded_file.name}")
+                try:
+                    process_document(uploaded_file)
+                    # response = requests.post(GET_RAG_AGENT_URL, json={}, timeout=500)
+                    # response.raise_for_status()
+                    # print(f"RAG Agent Response: {response.json()}")
+                    # state.RAG_summary = response.json().get("summary", "")
+                    # state.unanswered_questions = response.json().get("unanswered_questions", [])
+                    # print(f"Unanswered Questions: {state.unanswered_questions}")
+                    st.success(f"✅ {uploaded_file.name} processed and stored successfully!")
+                except Exception as e:
+                    st.error(f"❌ Error processing {uploaded_file.name}: {e}")
+
+        # Hide uploader after processing
+        st.session_state.show_uploader = False
+        st.session_state.documents_processed = True
+        st.rerun()
