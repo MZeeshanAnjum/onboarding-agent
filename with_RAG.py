@@ -2,7 +2,7 @@ from pydantic import BaseModel, Field
 from typing import List, Optional, Dict
 from langgraph.graph import StateGraph, END, START
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-from prompts.prompt import *
+from requirements_agent.prompts.prompt import *
 from pydantic import BaseModel, Field
 from typing import Optional, List, Annotated
 from llm import llm
@@ -11,14 +11,12 @@ from langgraph.types import interrupt, Command
 import logging
 from logging import getLogger
 
-from agents_helper.ag2 import RAGAgent
-from utils.rag import Initialize_vector_store
+from requirements_agent.ag2 import RAGAgent
+from requirements_agent.utils.rag import Initialize_vector_store
 
 import base64
 from io import BytesIO
-
 import json
-
 from collections import defaultdict
 
 logger = getLogger("onboarding_agent")
@@ -29,7 +27,7 @@ formatter = logging.Formatter(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
-with open('topics.json', 'r', encoding='utf-8') as f:
+with open('requirements_agent/topics.json', 'r', encoding='utf-8') as f:
     categories = json.load(f)
 
 def get_subtopics(category_name):
@@ -95,6 +93,8 @@ class AgentState(BaseModel):
     all_questions_answered: bool = False
     question_index: int = 0
     intro:bool = False
+    is_first_message: bool = True
+    breakpoint: bool = False
 
 
 class OnboardingAgent:
@@ -113,7 +113,7 @@ class OnboardingAgent:
         builder.add_node("AskUnansweredQuestions", self.ask_unanswered_questions)
 
         # builder.add_conditional_edges(START, self.route, {"GatherInformation": "GatherInformation", "UserConfirmation": "UserConfirmation"})
-        builder.add_conditional_edges(START,self.check_documents_uploaded, {"UserConfirmation": "UserConfirmation", "VerifyInformation": "VerifyInformation", "AskUnansweredQuestions": "AskUnansweredQuestions"})
+        builder.add_conditional_edges(START,self.check_documents_uploaded, {"UserConfirmation": "UserConfirmation", "VerifyInformation": "VerifyInformation", "AskUnansweredQuestions": "AskUnansweredQuestions", "RAGBasedAgent": "RAGBasedAgent"})
         builder.add_conditional_edges("VerifyInformation", self.route, {"UserConfirmation": "UserConfirmation", "GatherInformation": "GatherInformation","AskUnansweredQuestions": "AskUnansweredQuestions"})
         builder.add_edge("UserConfirmation", "GenerateSummary")
         builder.add_edge("GatherInformation", "GenerateSummary")
@@ -122,6 +122,7 @@ class OnboardingAgent:
         builder.add_conditional_edges("GenerateSummary",self.confirmation_route, {"SuggestAgents": "SuggestAgents", "END": END})
         builder.add_conditional_edges("AskUnansweredQuestions",self.check_all_questions_answered, {"UserConfirmation": "UserConfirmation", "END": END})
         builder.add_edge("GenerateSummary", END)
+        builder.add_edge("RAGBasedAgent", "AskUnansweredQuestions")
         # builder.add_edge(START, "VerifyInformation")
         # builder.add_conditional_edges("VerifyInformation", self.route, {"UserConfirmation": "UserConfirmation", "GatherInformation": "GatherInformation"})
         # builder.add_edge("UserConfirmation", "GenerateSummary")
@@ -131,6 +132,9 @@ class OnboardingAgent:
         return builder.compile()
 
     def check_documents_uploaded(self, state: AgentState) -> str:
+        if state.documents_uploaded and not state.breakpoint:
+            return "RAGBasedAgent"
+
         if state.documents_uploaded and state.all_questions_answered:
             return "UserConfirmation"
         elif state.documents_uploaded and not state.all_questions_answered:
@@ -199,6 +203,7 @@ class OnboardingAgent:
         context_history = state.context_history.copy()
         context_history.append({"role": "user", "content": state.query})
         intro = state.intro
+        is_first_message = state.is_first_message
 
         if not intro:
 
@@ -235,6 +240,7 @@ class OnboardingAgent:
             print(f"\nCurrent Subtopics: {current_subtopics}\n")
 
             prompt=ASK_FOLLOWUP_QUESTION_PROMPT3.format(
+                is_first_message=is_first_message,
                 business_summary=state.RAG_summary,
                 current_category=current_category,
                 current_subtopics=current_subtopics,
@@ -247,9 +253,11 @@ class OnboardingAgent:
             print(f"\n Response: {response} \n")
             
             question_index += 1
+            is_first_message = False
 
-            context_history.append({"role": "assistant", "content": response.response})
-            return {"context_history": context_history,"question_index": question_index,"all_questions_answered": response.all_questions_answered}
+            if not response.all_questions_answered:
+                context_history.append({"role": "assistant", "content": response.response})
+            return {"context_history": context_history,"question_index": question_index,"all_questions_answered": response.all_questions_answered,"intro": intro,"is_first_message": is_first_message}
 
     def verify_information(self,state: AgentState) -> AgentState:
         print("Verifying information")
@@ -311,11 +319,12 @@ class OnboardingAgent:
         print("\n \n In User confirmation")
 
         context_history = state.context_history.copy()
-        if context_history and context_history[-1]["role"] != "user":
+        last_message = context_history[-1]
+        if last_message["role"] != "user":
             context_history.append({"role": "user", "content": state.query})
 
+        print(f"\nContext History: {context_history}\n")
         prompt = USER_CONFIRMATION_PROMPT.format(
-            query=state.query,
             context_history="\n".join([f"{msg['role'].capitalize()}: {msg['content']}" for msg in context_history[-10:]] if context_history else "")
         )
 
@@ -350,8 +359,8 @@ class OnboardingAgent:
             results = rag_agent.graph.invoke(results)
             if results.get("breakpoint", False):
                 break
-            
-        return {"RAG_summary": results.get("summary", ""), "unanswered_questions": results.get("unanswered_questions", [])}
+
+        return {"RAG_summary": results.get("summary", ""), "unanswered_questions": results.get("unanswered_questions", []), "breakpoint": results.get("breakpoint", False)}
 
     def visualize(self):
         logger.info("Getting visualized planner agent")
