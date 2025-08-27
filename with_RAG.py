@@ -12,11 +12,12 @@ import logging
 from logging import getLogger
 
 from requirements_agent.ag2 import RAGAgent
-from requirements_agent.utils.rag import Initialize_vector_store
+from requirements_agent.utils.rag import Initialize_vector_store, embeddings
 
 import base64
 from io import BytesIO
 import json
+import re
 from collections import defaultdict
 
 logger = getLogger("onboarding_agent")
@@ -69,6 +70,10 @@ class OnboardingResponse(BaseModel):
     intro: bool = False
     response: str = ""
 
+class RAGResponse(BaseModel):
+    response: str
+    status: bool
+
 
 class UserConfirmation(BaseModel):
     user_confirmation: bool=False
@@ -80,7 +85,7 @@ class AskUnansweredQuestions(BaseModel):
     response:str = ""
 
 class AgentState(BaseModel):
-    documents_uploaded:bool = False
+    documents_uploaded:bool = True # Set this to False
     RAG:bool = False
     RAG_summary: str = ""
     unanswered_questions: List[dict] = []
@@ -94,8 +99,14 @@ class AgentState(BaseModel):
     question_index: int = 0
     intro:bool = False
     is_first_message: bool = True
-    breakpoint: bool = False
+    breakpoint: bool = True #TODO Set this to False
+    new_context_history: Annotated[list[dict], override] = []
+    team_information: bool = False
+    agent_suggested: bool = False
 
+def extract_team_info(summary: str) -> str:
+    match = re.search(r"- \*\*Team Information\*\*:[\s\S]*", summary)
+    return match.group(0).strip() if match else ""
 
 class OnboardingAgent:
     def __init__(self):
@@ -111,9 +122,10 @@ class OnboardingAgent:
         builder.add_node("SuggestAgents", self.suggest_agents)
         builder.add_node("RAGBasedAgent", self.rag_based_agent)
         builder.add_node("AskUnansweredQuestions", self.ask_unanswered_questions)
+        builder.add_node("ModifyAgents", self.modify_agents)
 
         # builder.add_conditional_edges(START, self.route, {"GatherInformation": "GatherInformation", "UserConfirmation": "UserConfirmation"})
-        builder.add_conditional_edges(START,self.check_documents_uploaded, {"UserConfirmation": "UserConfirmation", "VerifyInformation": "VerifyInformation", "AskUnansweredQuestions": "AskUnansweredQuestions", "RAGBasedAgent": "RAGBasedAgent"})
+        builder.add_conditional_edges(START,self.check_documents_uploaded, {"UserConfirmation": "UserConfirmation", "VerifyInformation": "VerifyInformation", "AskUnansweredQuestions": "AskUnansweredQuestions", "RAGBasedAgent": "RAGBasedAgent","ModifyAgents": "ModifyAgents"})
         builder.add_conditional_edges("VerifyInformation", self.route, {"UserConfirmation": "UserConfirmation", "GatherInformation": "GatherInformation","AskUnansweredQuestions": "AskUnansweredQuestions"})
         builder.add_edge("UserConfirmation", "GenerateSummary")
         builder.add_edge("GatherInformation", "GenerateSummary")
@@ -123,6 +135,8 @@ class OnboardingAgent:
         builder.add_conditional_edges("AskUnansweredQuestions",self.check_all_questions_answered, {"UserConfirmation": "UserConfirmation", "END": END})
         builder.add_edge("GenerateSummary", END)
         builder.add_edge("RAGBasedAgent", "AskUnansweredQuestions")
+        builder.add_edge("SuggestAgents", "ModifyAgents")
+        builder.add_edge("ModifyAgents", "GenerateSummary")
         # builder.add_edge(START, "VerifyInformation")
         # builder.add_conditional_edges("VerifyInformation", self.route, {"UserConfirmation": "UserConfirmation", "GatherInformation": "GatherInformation"})
         # builder.add_edge("UserConfirmation", "GenerateSummary")
@@ -132,9 +146,11 @@ class OnboardingAgent:
         return builder.compile()
 
     def check_documents_uploaded(self, state: AgentState) -> str:
+
         if state.documents_uploaded and not state.breakpoint:
             return "RAGBasedAgent"
-
+        if state.user_confirmation:
+            return "ModifyAgents"
         if state.documents_uploaded and state.all_questions_answered:
             return "UserConfirmation"
         elif state.documents_uploaded and not state.all_questions_answered:
@@ -156,7 +172,7 @@ class OnboardingAgent:
             return "GatherInformation"
     
     def confirmation_route(self, state: AgentState) -> str:
-        if state.user_confirmation:
+        if state.user_confirmation and not state.agent_suggested:
             return "SuggestAgents"
         else:
             return "END"
@@ -206,26 +222,47 @@ class OnboardingAgent:
         is_first_message = state.is_first_message
 
         if not intro:
+            summary = state.summary if state.summary else state.RAG_summary
+            team_info = extract_team_info(summary)
+            print(team_info)
 
             prompt = ASK_ONBOARDING_PROMPT.format(
-                business_summary=state.RAG_summary,
-                context_history="\n".join([f"{msg['role'].capitalize()}: {msg['content']}" for msg in context_history[-10:]] if context_history else ""),
+                business_summary=f" {summary[:300]}\n TeamStructure information: {team_info}",
+                context_history="\n".join([f"{msg['role'].capitalize()}: {msg['content']}" for msg in context_history] if context_history else ""),
             )
             print(f"\nPromp set")
             structured_llm = llm.with_structured_output(OnboardingResponse)
             messages = [AIMessage(content=prompt)]
             response = structured_llm.invoke(messages)
             print(f"\n Response: {response} \n")
-            
-            if not response.intro: 
-                context_history.append({"role": "assistant", "content": response.response})
-                return {"context_history": context_history, "intro": response.intro}
+            intro = response.intro
 
-            if response.intro:
-                intro = response.intro
+            if not intro:
+                if len(context_history) >=5:
+                    answer = self.get_rag_answer(response.response,context_history = context_history[-4:])
+                    print(answer)
+                    if answer.status:
+                        context_history.append({"role": "assistant asking from RAG Agent", "content": response.response, "assistant":"assistant_to_docs"})
+                        context_history.append({"role": "RAG Agent Response", "content": answer.response})
+
+                        state.context_history = context_history
+                        state.intro = intro
+
+                        return self.ask_unanswered_questions(state)
+
+                    else:
+                        context_history.append({"role": "assistant", "content": response.response})
+                        return {"context_history": context_history, "intro": intro}
+                else:
+                    context_history.append({"role": "assistant", "content": response.response})
+                    return {"context_history": context_history, "intro": intro}
+            # if intro:
+            #     intro = response.intro
 
         if intro:
             question_index = state.question_index
+
+            print("Intro has been completed")
 
             if question_index >= len(state.unanswered_questions):
                 current_category = "Completed"
@@ -236,11 +273,8 @@ class OnboardingAgent:
                 current_category = next_q["section"]
                 current_subtopics = next_q["question"]
 
-            print(f"\nCurrent Category: {current_category}\n")
-            print(f"\nCurrent Subtopics: {current_subtopics}\n")
-
             prompt=ASK_FOLLOWUP_QUESTION_PROMPT3.format(
-                is_first_message=is_first_message,
+                # is_first_message=is_first_message,
                 business_summary=state.RAG_summary,
                 current_category=current_category,
                 current_subtopics=current_subtopics,
@@ -345,10 +379,12 @@ class OnboardingAgent:
         )
         response = llm.invoke([AIMessage(content=prompt)])
 
+        print(f"Suggest Agents Response: {response}")
+
         context_history=context_history[:-1]  # Remove the last assistant message
-        context_history.append({"role": "assistant", "content": response.content})
+        context_history.append({"role": "assistant", "content": response.content, "assistant": "suggest_agent"})
         # Implement your agent suggestion logic here
-        return {"context_history": context_history}
+        return {"context_history": context_history, "suggested_agents": response.content, "agent_suggested": True}
 
     def rag_based_agent(self, state: AgentState) -> AgentState:
         print("\n \n In RAG Based Agent")
@@ -362,13 +398,61 @@ class OnboardingAgent:
 
         return {"RAG_summary": results.get("summary", ""), "unanswered_questions": results.get("unanswered_questions", []), "breakpoint": results.get("breakpoint", False)}
 
+        messages = [AIMessage(content=prompt)]
+        response = llm.invoke(messages)
+
+        context_history.append({"role": "assistant", "content": response.content})
+        return {"context_history": context_history, "rag_answer": response.content}
+
+    def modify_agents(self,state: AgentState) -> AgentState:
+
+        print("In Modifying the Agents Node")
+        context_history = state.context_history.copy()
+        try:
+            if context_history and not context_history[-1].get("assistant"):
+                print("updating the context_history")
+                context_history.append({"role": "user", "content": state.query})
+        except Exception as e:
+            print(f"Error occurred: {e}")
+
+        prompt=MODIFY_AGENTS_PROMPT.format(
+            summary=state.summary,
+            suggested_agents=state.suggested_agents,
+            context_history= "\n".join([f"{msg['role'].capitalize()}: {msg['content']}" for msg in context_history[-14:]] if context_history else ""),
+        )
+
+        messages = [AIMessage(content=prompt)]
+        structured_llm = llm.with_structured_output(UserConfirmation)
+        response = structured_llm.invoke(messages)
+        print(f"\n Modify Agents: {response}")
+        
+        context_history.append({"role": "assistant", "content": response.response})
+        return {"context_history": context_history}
+
     def visualize(self):
         logger.info("Getting visualized planner agent")
         png_image   = self.graph.get_graph(xray=True).draw_mermaid_png()
         image_buf   = BytesIO(png_image)
         img_str     = base64.b64encode(image_buf.getvalue()).decode("utf-8")
         return {"selection_agent_base64": f"data:image/png;base64,{img_str}"}
-    
+
+    def get_rag_answer(self, question: str, context_history: Optional[List[Dict]] = None) -> RAGResponse:
+
+        vector_store = Initialize_vector_store()
+        retriever = vector_store.as_retriever(search_kwargs={"k": 3})
+        retrieved_docs = retriever.invoke(question)
+        retrieved_text = "\n".join([doc.page_content.strip() for doc in retrieved_docs])
+        print(retrieved_text)
+        prompt = RAG_BASED_AGENT_PROMPT.format(
+            query=question,
+            data=retrieved_text,
+            context_history="\n".join([f"{msg['role'].capitalize()}: {msg['content']}" for msg in context_history] if context_history else ""),
+        )
+        messages = [AIMessage(content=prompt)]
+        structured_llm = llm.with_structured_output(RAGResponse)
+        response = structured_llm.invoke(messages)
+        return response
+
 if __name__ == "__main__":
     agent = OnboardingAgent()
     # Example usage
